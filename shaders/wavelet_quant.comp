@@ -7,10 +7,26 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_vote : require
 #extension GL_KHR_shader_subgroup_shuffle_relative : require
+#if !COMPAT
 #extension GL_KHR_shader_subgroup_clustered : require
+#endif
+#if !COMPAT
 #extension GL_EXT_shader_8bit_storage : require
+#endif
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+
+#if COMPAT
+// Device without clustered subgroup operations: the same sums and maxima inside each cluster of n
+// invocations, built from XOR shuffles (every invocation of a cluster gets the result).
+uint cl_add(uint x, uint n) { for (uint o = 1u; o < n; o <<= 1u) x += subgroupShuffleXor(x, o); return x; }
+int cl_add(int x, uint n) { for (uint o = 1u; o < n; o <<= 1u) x += subgroupShuffleXor(x, o); return x; }
+float cl_add(float x, uint n) { for (uint o = 1u; o < n; o <<= 1u) x += subgroupShuffleXor(x, o); return x; }
+float cl_max(float x, uint n) { for (uint o = 1u; o < n; o <<= 1u) x = max(x, subgroupShuffleXor(x, o)); return x; }
+#else
+#define cl_add subgroupClusteredAdd
+#define cl_max subgroupClusteredMax
+#endif
 
 #include "dwt_quant_scale.h"
 #include "constants.h"
@@ -52,8 +68,30 @@ layout(set = 0, binding = 2) writeonly buffer SSBOBlockStats
 layout(set = 0, binding = 3) buffer Payloads
 {
     layout(offset = 0) uint counter;
+#if COMPAT
+    layout(offset = 8) uint data[];
+#else
     layout(offset = 8) uint8_t data[];
+#endif
 } payload_data;
+
+#if COMPAT
+// Device without storageBuffer8BitAccess: bytes are written through 32-bit words. The masks of different
+// bytes are disjoint, so two atomics per byte give the same bytes as a native 8-bit store.
+void store_u8(uint byte_offset, uint v)
+{
+    uint w = byte_offset >> 2u;
+    uint sh = (byte_offset & 3u) * 8u;
+    atomicAnd(payload_data.data[w], ~(0xffu << sh));
+    atomicOr(payload_data.data[w], (v & 0xffu) << sh);
+}
+#else
+void store_u8(uint byte_offset, uint v)
+{
+    payload_data.data[byte_offset] = uint8_t(v);
+}
+#endif
+
 
 #include "dwt_swizzle.h"
 
@@ -123,7 +161,7 @@ float compute_square_error(mat2x4 v, int q, out uint num_significant_values)
     iv[1] += mix(vec4(0.0), vec4(0.5), notEqual(iv[1], vec4(0.0)));
     iv = mat2x4(trunc(ldexp(iv[0], ivec4(q))), trunc(ldexp(iv[1], ivec4(q))));
     mat2x4 err = v - iv;
-    num_significant_values = subgroupClusteredAdd(num_significant_values, 8);
+    num_significant_values = cl_add(num_significant_values, 8);
     return (dot(err[0], err[0]) + dot(err[1], err[1])) * registers.rdo_distortion_scale;
 }
 
@@ -160,7 +198,7 @@ QuantResult compute_quant_stats(mat2x4 v, int q, int msb, int block4x2_max, floa
     }
 
     result.encode_cost_early += findMSB(result.block4x2_shifted) + 1;
-    result.encode_cost_late_bits = 8 * subgroupClusteredAdd(max(result.encode_cost_early - 1, 0), 8) + int(wave8_num_significants);
+    result.encode_cost_late_bits = 8 * cl_add(max(result.encode_cost_early - 1, 0), 8) + int(wave8_num_significants);
     return result;
 }
 
@@ -172,7 +210,7 @@ float square(float v)
 void encode_payload(ivec2 block_index_8x8, mat2x4 texels)
 {
     precise float max_subblock_texel = max(max4(abs(texels[0])), max4(abs(texels[1])));
-    precise float max_wave_texels = subgroupClusteredMax(max_subblock_texel, 8);
+    precise float max_wave_texels = cl_max(max_subblock_texel, 8);
     float quant_scale;
     uint quant_code;
     compute_quant_scale(max_wave_texels, quant_code, quant_scale);
@@ -240,7 +278,7 @@ void encode_payload(ivec2 block_index_8x8, mat2x4 texels)
     for (int q = 1; q <= msb; q++)
     {
         QuantResult quant_result = compute_quant_stats(texels, q, msb, block4x2_max, inv_quant_squared);
-        float square_error = subgroupClusteredAdd(quant_result.square_error, 8);
+        float square_error = cl_add(quant_result.square_error, 8);
 
         if ((gl_SubgroupInvocationID & 7u) == 0)
         {
@@ -251,7 +289,7 @@ void encode_payload(ivec2 block_index_8x8, mat2x4 texels)
     }
 
     // Record distortion for throwing away everything.
-    float square_error = subgroupClusteredAdd((dot(texels[0], texels[0]) + dot(texels[1], texels[1])) * inv_quant_squared, 8);
+    float square_error = cl_add((dot(texels[0], texels[0]) + dot(texels[1], texels[1])) * inv_quant_squared, 8);
     if ((gl_SubgroupInvocationID & 7u) == 0)
         block_stats.stats[block_index].errors[msb + 1] = QuantStats(float16_t(min(60000.0, square_error)), uint16_t(0));
 
@@ -264,7 +302,7 @@ void encode_payload(ivec2 block_index_8x8, mat2x4 texels)
         uvec4 s0 = uvec4(lessThan(texels[0], vec4(0.0))) << uvec4(0, 1, 2, 3);
         uvec4 s1 = uvec4(lessThan(texels[1], vec4(0.0))) << uvec4(4, 5, 6, 7);
         uint s = s0.x | s0.y | s0.z | s0.w | s1.x | s1.y | s1.z | s1.w;
-        payload_data.data[byte_offset++] = uint8_t(s);
+        store_u8(byte_offset++, s);
 
         int plane_iterations = quality_planes + int(plane_code);
         int q = plane_iterations - 1;
@@ -283,7 +321,7 @@ void encode_payload(ivec2 block_index_8x8, mat2x4 texels)
             s0 <<= uvec4(0, 1, 2, 3);
             s1 <<= uvec4(4, 5, 6, 7);
             s = s0.x | s0.y | s0.z | s0.w | s1.x | s1.y | s1.z | s1.w;
-            payload_data.data[byte_offset++] = uint8_t(s);
+            store_u8(byte_offset++, s);
             q--;
         } while (q >= 0);
     }
