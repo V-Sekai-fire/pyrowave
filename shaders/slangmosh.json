@@ -12,7 +12,10 @@
 		{
 			"name": "block_packing",
 			"compute": true,
-			"path": "block_packing.comp"
+			"path": "block_packing.comp",
+			"variants": [
+				{ "define": "COMPAT", "count": 2, "resolve": true }
+			]
 		},
 		{
 			"name": "idwt",
@@ -57,7 +60,10 @@
 		{
 			"name": "wavelet_quant",
 			"compute": true,
-			"path": "wavelet_quant.comp"
+			"path": "wavelet_quant.comp",
+			"variants": [
+				{ "define": "COMPAT", "count": 2, "resolve": true }
+			]
 		},
 		{
 			"name": "wavelet_dequant",

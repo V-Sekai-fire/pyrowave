@@ -280,6 +280,9 @@ bool WaveletBuffers::init(Device *device_, int width_, int height_, ChromaSubsam
 		LOGI("Using texel buffers instead of SSBO.\n");
 
 	shaders = Shaders<>(*device, layout, [this](const char *, const char *env) {
+		if (strcmp(env, "COMPAT") == 0)
+			return (device->get_device_features().vk12_features.storageBuffer8BitAccess &&
+			        (device->get_device_features().vk11_props.subgroupSupportedOperations & VK_SUBGROUP_FEATURE_CLUSTERED_BIT)) ? 0 : 1;
 		if (strcmp(env, "FP16") == 0)
 			return device->get_device_features().vk12_features.shaderFloat16 ? 1 : 0;
 		return 0;

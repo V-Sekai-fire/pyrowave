@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Copyright (c) 2025 Hans-Kristian Arntzen
 // SPDX-License-Identifier: MIT
 #include "pyrowave_encoder.hpp"
@@ -1174,12 +1175,26 @@ bool Encoder::Impl::encode_quant_and_coding(
 	return true;
 }
 
+// PYROWAVE_CLEAR_OUTPUT=1: zero the bitstream buffer before each frame, so the alignment bytes at the end of
+// a 32x32 block (which the format says a decoder ignores) are not left over from an earlier frame. Off by
+// default: it costs a fill of the whole buffer per frame.
+static void clear_output(CommandBuffer &cmd, const Encoder::BitstreamBuffers &buffers)
+{
+	static const bool enabled = []() {
+		const char *e = getenv("PYROWAVE_CLEAR_OUTPUT");
+		return e && *e == '1';
+	}();
+	if (enabled && buffers.bitstream.buffer)
+		cmd.fill_buffer(*buffers.bitstream.buffer, 0, buffers.bitstream.offset, buffers.bitstream.size);
+}
+
 bool Encoder::Impl::encode_pre_transformed(
 		Vulkan::CommandBuffer &cmd, const BitstreamBuffers &buffers, float quant_scale)
 {
 	cmd.fill_buffer(*payload_data, 0, 0, 2 * sizeof(uint32_t));
 	cmd.fill_buffer(*bucket_buffer, 0);
 	cmd.fill_buffer(*quant_buffer, 0);
+	clear_output(cmd, buffers);
 
 	// Don't need to read the payload offset counter until quantizer.
 	cmd.barrier(VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -1207,6 +1222,7 @@ bool Encoder::Impl::encode(CommandBuffer &cmd, const ViewBuffers &views, const B
 	cmd.fill_buffer(*payload_data, 0, 0, 2 * sizeof(uint32_t));
 	cmd.fill_buffer(*bucket_buffer, 0);
 	cmd.fill_buffer(*quant_buffer, 0);
+	clear_output(cmd, buffers);
 
 	cmd.enable_subgroup_size_control(true);
 	if (!dwt(cmd, views))
@@ -1235,7 +1251,6 @@ bool Encoder::init(Device *device, int width_, int height_, ChromaSubsampling ch
 			VK_SUBGROUP_FEATURE_SHUFFLE_RELATIVE_BIT |
 			VK_SUBGROUP_FEATURE_VOTE_BIT |
 			VK_SUBGROUP_FEATURE_BALLOT_BIT |
-			VK_SUBGROUP_FEATURE_CLUSTERED_BIT |
 			VK_SUBGROUP_FEATURE_BASIC_BIT;
 
 	if ((ops & required_features) != required_features)
@@ -1245,8 +1260,6 @@ bool Encoder::init(Device *device, int width_, int height_, ChromaSubsampling ch
 		return false;
 	}
 
-	if (!device->get_device_features().vk12_features.storageBuffer8BitAccess)
-		return false;
 	if (!device->get_device_features().enabled_features.shaderInt16)
 		return false;
 
