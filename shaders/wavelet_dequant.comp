@@ -255,6 +255,10 @@ void main()
     uint q_code = read_payload_u8(4 * int(offset_u32) + 4);
 #endif
 
+    // Each 8x8 block's first payload byte: a scan of byte_cost over the 16 blocks, local_index 0-15.
+    uint plane_base = offset_u32 * 4 + 8 + 3 * bitCount(ballot);
+    uint byte_cost = 0;
+
     if (local_index < 16)
     {
         uint control_word = 0;
@@ -276,12 +280,37 @@ void main()
         uint msbs = control_word & 0xaaaau;
         uint msbs_shift = msbs >> 1;
         msbs |= msbs_shift;
-        uint byte_cost = bitCount(lsbs) + bitCount(msbs) + q_bits * 8;
+        byte_cost = bitCount(lsbs) + bitCount(msbs) + q_bits * 8;
 
-        uint byte_scan = offset_u32 * 4 + 8 + 3 * bitCount(ballot) + subgroupInclusiveAdd(byte_cost);
-        if (local_index == 15)
-            shared_sign_offset = 8 * byte_scan;
-        shared_plane_byte_offsets[local_index] = byte_scan - byte_cost;
+        if (gl_SubgroupSize >= 16)
+        {
+            uint byte_scan = plane_base + subgroupInclusiveAdd(byte_cost);
+            if (local_index == 15)
+                shared_sign_offset = 8 * byte_scan;
+            shared_plane_byte_offsets[local_index] = byte_scan - byte_cost;
+        }
+        else
+        {
+            shared_plane_byte_offsets[local_index] = byte_cost;
+        }
+    }
+
+    if (gl_SubgroupSize < 16)
+    {
+        // Subgroups narrower than 16 lanes (lavapipe at 256-bit vectors has 8) would restart the scan
+        // in each subgroup, so scan the 16 costs through shared memory instead.
+        barrier();
+        uint exclusive = 0;
+        if (local_index < 16)
+            for (uint i = 0; i < local_index; i++)
+                exclusive += shared_plane_byte_offsets[i];
+        barrier();
+        if (local_index < 16)
+        {
+            if (local_index == 15)
+                shared_sign_offset = 8 * (plane_base + exclusive + byte_cost);
+            shared_plane_byte_offsets[local_index] = plane_base + exclusive;
+        }
     }
 
     barrier();
