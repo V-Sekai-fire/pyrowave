@@ -1,0 +1,76 @@
+name: decode
+
+# Builds this PyroWave checkout into pillow-pyrowave and runs its tests: frames from an independent
+# encoder must decode to the right pictures. The runners have no GPU, so the jobs cover the subgroup
+# sizes PyroWave's shaders must handle: lavapipe (Mesa's CPU Vulkan) at 8 and 16 lanes, MoltenVK at
+# 32, and a Metal build (the macOS runner's GPU cannot run the Metal port).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  decode:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-lavapipe-8-lanes, os: ubuntu-latest }
+          - { name: linux-lavapipe-16-lanes, os: ubuntu-latest, lp_width: "512" }
+          - { name: windows-lavapipe-8-lanes, os: windows-latest }
+          - { name: macos-moltenvk-32-lanes, os: macos-latest, vulkan_on_apple: true }
+          - { name: macos-metal-build, os: macos-latest, build_only: true }
+    env:
+      LP_NATIVE_VECTOR_WIDTH: ${{ matrix.lp_width }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: pyrowave
+
+      - uses: actions/checkout@v5
+        with:
+          repository: V-Sekai-fire/pillow-pyrowave
+          ref: main
+          path: pillow-pyrowave
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Vulkan (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mesa-vulkan-drivers libvulkan1 vulkan-tools
+          vulkaninfo | grep -E "deviceName|subgroupSize" | head -4
+
+      - name: Vulkan (Windows)
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1
+        with:
+          install_runtime: true
+          install_lavapipe: true
+          cache: true
+          stripdown: true
+
+      - name: Vulkan (macOS, MoltenVK)
+        if: matrix.vulkan_on_apple
+        run: |
+          brew install molten-vk vulkan-loader vulkan-tools
+          echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+
+      - name: Build pillow-pyrowave against this checkout
+        shell: bash
+        run: |
+          src=$(python -c "import pathlib; print(pathlib.Path('pyrowave').resolve().as_posix())")
+          extra=()
+          if [ "${{ matrix.vulkan_on_apple }}" = "true" ]; then extra=(-C cmake.define.PILLOW_PYROWAVE_VULKAN=ON); fi
+          python -m pip install -v "./pillow-pyrowave[test]" -C "cmake.define.FETCHCONTENT_SOURCE_DIR_PYROWAVE=$src" "${extra[@]}"
+
+      - name: Test
+        if: ${{ !matrix.build_only }}
+        run: python -m pytest -v pillow-pyrowave/tests
